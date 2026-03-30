@@ -1,6 +1,6 @@
 # ***cyCombine Shiny Implementation***
 
-This is a Shiny implementation of the existing cyCombine tool for multi-batch cytometry data integration and normalization.
+This is a Shiny implementation of the existing cyCombine tool for multi-batch cytometry data integration and normalization. (PMID: 35361793) 
 
 Original cyCombine repository: cyCombine on GitHub https://github.com/biosurf/cyCombine
 
