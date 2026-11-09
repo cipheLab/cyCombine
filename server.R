@@ -23,7 +23,7 @@ server <- function(input, output, session) {
     }
     return(name)
   }
-  
+
   # ---------------------------------------------
   # Directory to save models
   # Creates directory if it doesn't exist
@@ -99,7 +99,7 @@ server <- function(input, output, session) {
       rv$batch_names[[i]] <- input[[paste0("batch_name_", i)]]
     }
   })
-  
+
   # ---------------------------------------------
   # Observe file uploads for each batch
   # Reads FCS files, applies compensation, updates design table
@@ -119,7 +119,8 @@ server <- function(input, output, session) {
             ff <- read.FCS(
               files_input$datapath[j],
               transformation = FALSE,
-              truncate_max_range = FALSE
+              truncate_max_range = FALSE,
+              emptyValue = FALSE
             )
             
             # -------------------------
@@ -172,65 +173,369 @@ server <- function(input, output, session) {
     }
   })
   
+  
   # ---------------------------------------------
   # Build panel table for all batches
   # Shows fluorochrome and marker names for comparison
   # ---------------------------------------------
   observe({
+    
     req(length(rv$fs_list) > 0)
     
     n_batches <- length(rv$fs_list)
     panel_list <- list()
-    max_len <- 0
     
+    # ---------------------------------------------
+    # Helper: normalize names for comparison
+    # ---------------------------------------------
+    normalize_marker <- function(x) {
+      x <- as.character(x)
+      x[is.na(x)] <- ""
+      
+      x <- trimws(tolower(x))
+      x <- sub("[-_ ]+[abc]$", "", x)
+      x <- gsub("[^[:alnum:]]", "", x)
+      
+      x
+    }
+    
+    # ---------------------------------------------
+    # Extract parameters from each batch
+    # ---------------------------------------------
     for (i in seq_len(n_batches)) {
+      
+      req(length(rv$fs_list[[i]]) > 0)
+      
       ff <- rv$fs_list[[i]][[1]]
       param_data <- ff@parameters@data
       
-      fluo <- param_data$name
-      marker <- param_data$desc
+      fluo <- as.character(param_data$name)
+      marker <- as.character(param_data$desc)
       
-      # Replace empty marker names with fluorochrome names
-      marker[is.na(marker) | marker == ""] <- fluo
+      # Replace empty descriptions with fluorochrome names
+      missing_marker <- is.na(marker) | trimws(marker) == ""
+      marker[missing_marker] <- fluo[missing_marker]
       
-      # Detect if using mass cytometry (e.g., "123X_...")
-      is_mass <- mean(grepl("^[0-9]+[A-Za-z]+_", marker)) > 0.1
+      # Handle mass cytometry names
+      is_mass <- any(grepl(
+        "^[0-9]+[A-Za-z]+_",
+        marker
+      ), na.rm = TRUE)
+      
       if (is_mass) {
         marker <- sub(".*_", "", marker)
       }
       
-      df <- data.frame(
+      panel_list[[i]] <- data.frame(
         Fluo = fluo,
         Marker = marker,
         stringsAsFactors = FALSE
       )
-      
-      panel_list[[i]] <- df
-      max_len <- max(max_len, nrow(df))
     }
     
-    # Merge batch panels into one table
-    panel_table <- data.frame(matrix(nrow = max_len, ncol = 0))
+    # ---------------------------------------------
+    # Batch 1 is the reference order
+    # ---------------------------------------------
+    reference <- panel_list[[1]]
     
-    for (i in seq_len(n_batches)) {
-      df <- panel_list[[i]]
+    reference_marker_key <- normalize_marker(reference$Marker)
+    reference_fluo_key <- normalize_marker(reference$Fluo)
+    
+    aligned_list <- vector("list", n_batches)
+    aligned_list[[1]] <- reference
+    
+    # ---------------------------------------------
+    # Helper: find a unique approximate match
+    # ---------------------------------------------
+    find_approx_match <- function(target, candidates_keys, available) {
       
-      if (nrow(df) < max_len) {
-        df[(nrow(df)+1):max_len, ] <- NA
+      if (is.na(target) || target == "") {
+        return(NA_integer_)
       }
       
+      candidates <- which(
+        available &
+          candidates_keys != ""
+      )
+      
+      if (length(candidates) == 0) {
+        return(NA_integer_)
+      }
+      
+      similarities <- vapply(candidates, function(j) {
+        
+        d <- as.numeric(utils::adist(
+          target,
+          candidates_keys[j]
+        ))
+        
+        max_len <- max(
+          nchar(target),
+          nchar(candidates_keys[j]),
+          1
+        )
+        
+        1 - d / max_len
+        
+      }, numeric(1))
+      
+      best_score <- max(similarities)
+      best <- which(similarities == best_score)
+      
+      threshold <- if (nchar(target) <= 4) {
+        0.80
+      } else {
+        0.75
+      }
+      
+      if (best_score >= threshold && length(best) == 1) {
+        return(candidates[best])
+      }
+      
+      NA_integer_
+    }
+    
+    # ---------------------------------------------
+    # Align subsequent batches to Batch 1
+    # Priority:
+    # 1. Exact desc
+    # 2. Approximate desc
+    # 3. Exact name
+    # 4. Approximate name
+    # ---------------------------------------------
+    if (n_batches >= 2) {
+      
+      for (i in 2:n_batches) {
+        
+        current <- panel_list[[i]]
+        
+        current_marker_key <- normalize_marker(current$Marker)
+        current_fluo_key <- normalize_marker(current$Fluo)
+        
+        aligned_fluo <- rep(NA_character_, nrow(reference))
+        aligned_marker <- rep(NA_character_, nrow(reference))
+        
+        used <- rep(FALSE, nrow(current))
+        
+        for (r in seq_len(nrow(reference))) {
+          
+          matched <- FALSE
+          j <- NA_integer_
+          
+          # ---------------------------------------
+          # 1. Exact match on desc (marker)
+          # ---------------------------------------
+          target_marker <- reference_marker_key[r]
+          
+          if (!is.na(target_marker) && target_marker != "") {
+            
+            candidates <- which(
+              !used &
+                current_marker_key == target_marker &
+                current_marker_key != ""
+            )
+            
+            if (length(candidates) == 1) {
+              j <- candidates[1]
+            }
+          }
+          
+          # ---------------------------------------
+          # 2. Approximate match on desc
+          # Only if exact desc did not match
+          # ---------------------------------------
+          if (is.na(j)) {
+            
+            j <- find_approx_match(
+              target_marker,
+              current_marker_key,
+              !used
+            )
+          }
+          
+          # If desc matched, store and continue
+          if (!is.na(j)) {
+            
+            aligned_fluo[r] <- current$Fluo[j]
+            aligned_marker[r] <- current$Marker[j]
+            used[j] <- TRUE
+            
+            next
+          }
+          
+          # ---------------------------------------
+          # 3. Exact match on name (fluorochrome)
+          # Fallback if desc did not match
+          # ---------------------------------------
+          target_fluo <- reference_fluo_key[r]
+          
+          if (!is.na(target_fluo) && target_fluo != "") {
+            
+            candidates <- which(
+              !used &
+                current_fluo_key == target_fluo &
+                current_fluo_key != ""
+            )
+            
+            if (length(candidates) == 1) {
+              j <- candidates[1]
+            }
+          }
+          
+          # ---------------------------------------
+          # 4. Approximate match on name
+          # ---------------------------------------
+          if (is.na(j)) {
+            
+            j <- find_approx_match(
+              target_fluo,
+              current_fluo_key,
+              !used
+            )
+          }
+          
+          if (!is.na(j)) {
+            
+            aligned_fluo[r] <- current$Fluo[j]
+            aligned_marker[r] <- current$Marker[j]
+            used[j] <- TRUE
+          }
+        }
+        
+        # -----------------------------------------
+        # Append unmatched parameters at the end
+        # -----------------------------------------
+        unmatched <- which(!used)
+        
+        aligned <- data.frame(
+          Fluo = c(
+            aligned_fluo,
+            current$Fluo[unmatched]
+          ),
+          Marker = c(
+            aligned_marker,
+            current$Marker[unmatched]
+          ),
+          stringsAsFactors = FALSE
+        )
+        
+        aligned_list[[i]] <- aligned
+      }
+    }
+    
+    # ---------------------------------------------
+    # Build final table
+    # Batch 1 order is preserved
+    # ---------------------------------------------
+    max_len <- max(vapply(
+      aligned_list,
+      nrow,
+      integer(1)
+    ))
+    
+    panel_table <- data.frame(
+      matrix(nrow = max_len, ncol = 0)
+    )
+    
+    for (i in seq_len(n_batches)) {
+      
+      df <- aligned_list[[i]]
+      
+      if (nrow(df) < max_len) {
+        
+        extra <- max_len - nrow(df)
+        
+        df <- rbind(
+          df,
+          data.frame(
+            Fluo = rep(NA_character_, extra),
+            Marker = rep(NA_character_, extra),
+            stringsAsFactors = FALSE
+          )
+        )
+      }
+      
+      batch_name <- get_batch_name(i)
+      
       colnames(df) <- c(
-        paste0(get_batch_name(i), "_Fluo"),
-        paste0(get_batch_name(i), "_Marker")
+        paste0(batch_name, "_Fluo"),
+        paste0(batch_name, "_Marker")
       )
       
       panel_table <- cbind(panel_table, df)
     }
     
+    
+    # Conserver les sélections existantes lors de la reconstruction
+    old_panel <- isolate(rv$panel_table)
+    
+    # Par défaut, aucune sélection si c'est la première création
     panel_table$Normalize <- FALSE
+    
+    if (!is.null(old_panel) &&
+        "Normalize" %in% names(old_panel)) {
+      
+      ref_fluo_col <- paste0(get_batch_name(1), "_Fluo")
+      ref_marker_col <- paste0(get_batch_name(1), "_Marker")
+      
+      old_cols_ok <- all(
+        c(ref_fluo_col, ref_marker_col) %in% names(old_panel)
+      )
+      
+      new_cols_ok <- all(
+        c(ref_fluo_col, ref_marker_col) %in% names(panel_table)
+      )
+      
+      if (old_cols_ok && new_cols_ok) {
+        
+        # Construire une clé uniquement pour les lignes valides
+        old_valid <- (
+          !is.na(old_panel[[ref_fluo_col]]) &
+            !is.na(old_panel[[ref_marker_col]]) &
+            trimws(as.character(old_panel[[ref_fluo_col]])) != "" &
+            trimws(as.character(old_panel[[ref_marker_col]])) != ""
+        )
+        
+        new_valid <- (
+          !is.na(panel_table[[ref_fluo_col]]) &
+            !is.na(panel_table[[ref_marker_col]]) &
+            trimws(as.character(panel_table[[ref_fluo_col]])) != "" &
+            trimws(as.character(panel_table[[ref_marker_col]])) != ""
+        )
+        
+        old_key <- paste(
+          as.character(old_panel[[ref_fluo_col]]),
+          as.character(old_panel[[ref_marker_col]]),
+          sep = "|||"
+        )
+        
+        new_key <- paste(
+          as.character(panel_table[[ref_fluo_col]]),
+          as.character(panel_table[[ref_marker_col]]),
+          sep = "|||"
+        )
+        
+        old_normalize <- tolower(
+          trimws(as.character(old_panel$Normalize))
+        )
+        
+        selected_keys <- old_key[
+          old_valid &
+            !is.na(old_normalize) &
+            old_normalize %in% c("true", "t", "1", "yes")
+        ]
+        
+        panel_table$Normalize <- (
+          new_valid & new_key %in% selected_keys
+        )
+      }
+    }
+    
     rv$panel_table <- panel_table
+    
+    
   })
-
+  
   # ---------------------------------------------
   # Render interactive panel table with rhandsontable
   # Allows editing directly in the Shiny app
@@ -324,7 +629,7 @@ server <- function(input, output, session) {
           stringsAsFactors = FALSE
         )
       })
-      
+
       # Align markers across batches
       all_markers <- unique(na.omit(unlist(lapply(batch_list, function(x) x$Marker))))
       new_df <- data.frame(matrix(nrow = length(all_markers), ncol = 0))
@@ -352,7 +657,7 @@ server <- function(input, output, session) {
       df <- new_df
       marker_cols <- grep("_Marker$", names(df))
       
-      # Add MatchFlag to highlight markers present in multiple batches
+      # 
       df$MatchFlag <- apply(df[, marker_cols], 1, function(x) sum(!is.na(x)) > 1)
       df <- df[order(-df$MatchFlag), ]
       df$MatchFlag <- NULL
@@ -515,59 +820,126 @@ server <- function(input, output, session) {
   # =============================================
   # 3. Validate Design & Extract Data
   # =============================================
+  
+  # =============================================
+  # Validate Design & Extract Data
+  # Noms de référence = marqueurs du Batch 1
+  # Les fichiers FCS originaux restent inchangés
+  # =============================================
   observeEvent(input$Validate_design, {
-    # Show modal during processing
+    
     showModal(modalDialog(
       title = "Preparing data for cyCombine...",
-      tags$div(style = "text-align: center;", tags$p("Please wait while your data is being processed.")),
+      tags$p("Please wait while your data is being processed."),
       footer = NULL,
       easyClose = FALSE
     ))
     
     tryCatch({
-      # Filter panel to normalize
-      panel_to_norm <- rv$panel_table[rv$panel_table$Normalize == TRUE, ]
+      
+      req(rv$panel_table)
+      req(input$n_batches)
+      
+      panel <- rv$panel_table
       all_batches_df <- list()
       
-      for (i in 1:input$n_batches) {
-        batch_fs <- rv$fs_list[[i]]          
-        batch_design <- rv$design[rv$design$Batch == i, ]
+      # Les lignes cochées pour normalisation
+      normalize_rows <- which(
+        !is.na(panel$Normalize) & panel$Normalize == TRUE
+      )
+      
+      if (length(normalize_rows) == 0) {
+        stop("Please select at least one marker to normalize.")
+      }
+      
+      # Noms de référence du Batch 1
+      ref_col <- paste0(get_batch_name(1), "_Marker")
+      if (!ref_col %in% names(panel)) {
+        stop("Reference marker column for Batch 1 not found.")
+      }
+      
+      reference_markers <- as.character(panel[[ref_col]][normalize_rows])
+      
+      if (anyNA(reference_markers) ||
+          any(trimws(reference_markers) == "")) {
+        stop("Some selected markers have no reference name in Batch 1.")
+      }
+      
+      if (anyDuplicated(reference_markers)) {
+        stop("Selected reference marker names in Batch 1 must be unique.")
+      }
+      
+      for (i in seq_len(input$n_batches)) {
+        
         batch_name <- get_batch_name(i)
+        batch_fs <- rv$fs_list[[i]]
+        batch_design <- rv$design[rv$design$Batch == i, ]
         
-        # Get fluorochromes and markers to normalize
-        fluo_cols <- grep(paste0(batch_name, "_Fluo$"), names(panel_to_norm))
-        fluo_names <- panel_to_norm[[paste0(batch_name, "_Fluo")]]
-        markers    <- panel_to_norm[[paste0(batch_name, "_Marker")]]
+        fluo_col <- paste0(batch_name, "_Fluo")
+        marker_col <- paste0(batch_name, "_Marker")
         
-        valid_idx <- !is.na(fluo_names)
-        fluo_names <- fluo_names[valid_idx]
-        markers    <- markers[valid_idx]
+        if (!fluo_col %in% names(panel) ||
+            !marker_col %in% names(panel)) {
+          stop(paste("Panel columns not found for", batch_name))
+        }
         
-        # Extract expression matrix per FCS file
+        # Correspondance par ligne de la table d'harmonisation.
+        # On ne fait PAS de jointure sur les noms de marqueurs.
+        fluo_names <- as.character(panel[[fluo_col]][normalize_rows])
+        
+        if (anyNA(fluo_names) ||
+            any(trimws(fluo_names) == "")) {
+          stop(paste(
+            "A selected marker has no corresponding channel in",
+            batch_name
+          ))
+        }
+        
         for (j in seq_along(batch_fs)) {
+          
           ff <- batch_fs[[j]]
-          expr_mat <- exprs(ff)[, fluo_names, drop = FALSE]
-          colnames(expr_mat) <- markers
-          df <- as.data.frame(expr_mat)
+          mat <- flowCore::exprs(ff)
           
-          df$batch <- batch_name
-          df$File  <- batch_design$File[j]
-          
-          # Add covariate if selected
-          if (!is.null(input$covar) && input$covar != "No" && input$covar %in% colnames(expr_mat)) {
-            df$covar <- expr_mat[, input$covar]
+          if (anyDuplicated(fluo_names)) {
+            stop(paste("Duplicate channels selected in", batch_name))
           }
           
-          all_batches_df <- append(all_batches_df, list(df))
+          missing_channels <- setdiff(fluo_names, colnames(mat))
+          
+          if (length(missing_channels) > 0) {
+            stop(paste(
+              "Channels missing in", batch_name, ":",
+              paste(missing_channels, collapse = ", ")
+            ))
+          }
+          
+          expr_mat <- mat[, fluo_names, drop = FALSE]
+          
+          # Même nom backend dans tous les batches :
+          # le nom de référence du Batch 1.
+          colnames(expr_mat) <- reference_markers
+          
+          df <- as.data.frame(expr_mat, check.names = FALSE)
+          df$batch <- batch_name
+          df$File <- batch_design$File[j]
+          
+          all_batches_df[[length(all_batches_df) + 1L]] <- df
         }
       }
       
-      # Combine all batches into one dataframe
       rv$unnormalized_data <- do.call(rbind, all_batches_df)
-      showNotification("Data extracted and concatenated successfully.", type = "message")
+      
+      showNotification(
+        "Data extracted with Batch 1 marker names as backend reference.",
+        type = "message"
+      )
+      
       removeModal()
       
     }, error = function(e) {
+      
+      removeModal()
+      
       showModal(modalDialog(
         title = "Error",
         paste("An error occurred:", e$message),
@@ -603,63 +975,213 @@ server <- function(input, output, session) {
   # =============================================
   # 5. Apply Transformation
   # =============================================
+
   observeEvent(input$apply_transform, {
+    
     req(rv$unnormalized_data)
+    req(rv$panel_table)
+    req(rv$fs_list)
     
     showModal(modalDialog(
       title = "Applying Transformation",
-      tags$div(style = "text-align: center;", tags$p("Markers are being transformed, please wait...")),
+      tags$div(
+        style = "text-align: center;",
+        tags$p("Markers are being transformed, please wait...")
+      ),
       footer = NULL,
       easyClose = FALSE
     ))
     
-    df <- rv$unnormalized_data
-    rv$isTransformed <- TRUE
-    marker_cols <- setdiff(colnames(df), c("batch", "File"))
-    
-    # Exclude covariate column if present
-    if (!is.null(df[[input$covar]])) {
-      marker_cols <- setdiff(colnames(df), c("batch", "File", input$covar))
-    }
-    
-    rv$transformed_markers <- marker_cols
-    
-    # Apply asinh transformation
-    if (input$transform_mode == "global") {
-      cofactor <- input$global_cofactor
-      df[, marker_cols] <- asinh(df[, marker_cols] / cofactor)
+    tryCatch({
       
-      # Apply to FCS objects
-      for (i in 1:input$n_batches) {
-        batch_name <- get_batch_name(i)
-        mapping <- get_marker_to_fluo(batch_name)
-        fluo <- mapping[marker_cols]
+      df <- rv$unnormalized_data
+      
+      # Marqueurs communs utilisés en backend
+      marker_cols <- setdiff(
+        colnames(df),
+        c("batch", "File")
+      )
+      
+      # Exclure la covariable si elle existe réellement
+      covar <- input$covar
+      
+      if (!is.null(covar) &&
+          length(covar) == 1 &&
+          !is.na(covar) &&
+          nzchar(covar) &&
+          covar %in% colnames(df)) {
         
+        marker_cols <- setdiff(marker_cols, covar)
+      }
+      
+      validate(
+        need(length(marker_cols) > 0,
+             "Aucun marqueur à transformer.")
+      )
+      
+      rv$transformed_markers <- marker_cols
+      
+      # Noms de référence du Batch 1
+      reference_batch <- get_batch_name(1)
+      reference_col <- paste0(reference_batch, "_Marker")
+      
+      validate(
+        need(reference_col %in% colnames(rv$panel_table),
+             "Colonne des marqueurs du Batch 1 introuvable.")
+      )
+      
+      reference_markers <- trimws(
+        as.character(rv$panel_table[[reference_col]])
+      )
+      
+      panel <- rv$panel_table
+      
+      # Appliquer la transformation au dataframe et aux objets FCS en mémoire
+      for (i in seq_len(input$n_batches)) {
+        
+        batch_name <- get_batch_name(i)
+        fluo_col <- paste0(batch_name, "_Fluo")
+        
+        validate(
+          need(fluo_col %in% colnames(panel),
+               paste("Colonne des canaux introuvable :", fluo_col))
+        )
+        
+        fluo_names <- trimws(as.character(panel[[fluo_col]]))
+        
+        valid_idx <- (
+          !is.na(reference_markers) &
+            reference_markers != "" &
+            !is.na(fluo_names) &
+            fluo_names != ""
+        )
+        
+        marker_to_fluo <- stats::setNames(
+          fluo_names[valid_idx],
+          reference_markers[valid_idx]
+        )
+        
+        # Ne garder que les marqueurs demandés présents dans ce batch
+        current_markers <- intersect(
+          marker_cols,
+          names(marker_to_fluo)
+        )
+        
+        if (length(current_markers) == 0) {
+          next
+        }
+        
+        current_fluo <- unname(
+          marker_to_fluo[current_markers]
+        )
+        
+        # Vérifier les canaux dans tous les fichiers du batch
         for (file in seq_along(rv$fs_list[[i]])) {
-          exprs(rv$fs_list[[i]][[file]])[, fluo] <- asinh(exprs(rv$fs_list[[i]][[file]])[, fluo] / cofactor)
+          
+          fcs_obj <- rv$fs_list[[i]][[file]]
+          mat <- flowCore::exprs(fcs_obj)
+          
+          missing_fluo <- setdiff(current_fluo, colnames(mat))
+          
+          if (length(missing_fluo) > 0) {
+            stop(
+              "Canal(s) introuvable(s) dans le batch ",
+              batch_name, ", fichier ", file, " : ",
+              paste(missing_fluo, collapse = ", ")
+            )
+          }
+          
+          # Déterminer les lignes du dataframe pour ce fichier
+          design_rows <- which(rv$design$Batch == i)
+          
+          if (length(design_rows) < file) {
+            stop(
+              "Impossible d'associer le fichier ", file,
+              " au batch ", batch_name, " dans rv$design."
+            )
+          }
+          
+          design_row <- design_rows[file]
+          file_name <- as.character(rv$design$File[design_row])
+          batch_label <- as.character(rv$design$BatchName[design_row])
+          
+          df_rows <- (
+            as.character(df$batch) == batch_label &
+              as.character(df$File) == file_name
+          )
+          
+          df_rows[is.na(df_rows)] <- FALSE
+          
+          # Extraire le cofacteur
+          if (input$transform_mode == "global") {
+            
+            cofactor <- input$global_cofactor
+            
+          } else {
+            
+            cofactor <- input[[paste0("cofactor_batch_", i)]]
+          }
+          
+          validate(
+            need(
+              length(cofactor) == 1 &&
+                is.finite(cofactor) &&
+                cofactor > 0,
+              paste("Cofacteur invalide pour le batch", batch_name)
+            )
+          )
+          
+          # Transformer les valeurs du dataframe
+          if (any(df_rows)) {
+            
+            if (sum(df_rows) != nrow(mat)) {
+              stop(
+                "Le nombre d'événements ne correspond pas pour ",
+                file_name, " : dataframe = ", sum(df_rows),
+                ", FCS = ", nrow(mat), "."
+              )
+            }
+            
+            df[df_rows, current_markers] <- lapply(
+              df[df_rows, current_markers, drop = FALSE],
+              function(x) asinh(as.matrix(x) / cofactor)
+            )
+          }
+          
+          # Transformer les canaux correspondants dans l'objet FCS
+          mat[, current_fluo] <- asinh(
+            mat[, current_fluo, drop = FALSE] / cofactor
+          )
+          
+          flowCore::exprs(fcs_obj) <- mat
+          rv$fs_list[[i]][[file]] <- fcs_obj
         }
       }
       
-    } else { # Batch-specific cofactors
-      for (i in 1:input$n_batches) {
-        cofactor <- input[[paste0("cofactor_batch_", i)]]
-        batch_name <- get_batch_name(i)
-        idx <- df$batch == batch_name
-        df[idx, marker_cols] <- asinh(df[idx, marker_cols] / cofactor)
-        
-        mapping <- get_marker_to_fluo(batch_name)
-        fluo <- mapping[marker_cols]
-        
-        for (file in seq_along(rv$fs_list[[i]])) {
-          exprs(rv$fs_list[[i]][[file]])[, fluo] <- asinh(exprs(rv$fs_list[[i]][[file]])[, fluo] / cofactor)
-        }
-      }
-    }
+      rv$unnormalized_data <- df
+      rv$isTransformed <- TRUE
+      
+      removeModal()
+      
+      showNotification(
+        "Transformation appliquée au dataframe et aux objets FCS en mémoire.",
+        type = "message"
+      )
+      
+    }, error = function(e) {
+      
+      removeModal()
+      
+      showNotification(
+        paste("Erreur pendant la transformation :", conditionMessage(e)),
+        type = "error",
+        duration = NULL
+      )
+      
+    })
     
-    rv$unnormalized_data <- df
-    removeModal()
-    showNotification("Transformation applied to dataframe", type = "message")
   })
+ 
   
   # =============================================
   # 6. Design Validation
@@ -698,6 +1220,9 @@ server <- function(input, output, session) {
       df <- rv$unnormalized_data
       marker_cols <- setdiff(colnames(df), c("batch", "File"))
       
+      print(df)
+      print(input$goal_ref_batch)
+      
       # Reference batch selection
       ref_batch <- input$goal_ref_batch
       if (ref_batch == "NULL") ref_batch <- NULL else ref_batch <- as.character(ref_batch)
@@ -715,10 +1240,11 @@ server <- function(input, output, session) {
         rlen = input$rlen,               # SOM iterations
         seed = 101
       )
-      
+      print("ok")
       # Process normalized FCS objects
       rv$normalized_fcs <- process_normalized_fcs(rv, input)
       
+     
       removeModal()
       showNotification("cyCombine completed successfully.", type = "message")
       
@@ -797,117 +1323,271 @@ server <- function(input, output, session) {
   # =============================================
   # 3. Render Histogram (Before vs After)
   # =============================================
-  output$hist_plot <- renderPlot({
-    req(rv$unnormalized_data, rv$normalized_data, input$viz_marker_hist)
-    
-    marker <- input$viz_marker_hist
-    
-    # Combine unnormalized and normalized data for comparison
-    df <- bind_rows(
-      mutate(rv$unnormalized_data, State = "Before", batch = as.factor(batch)),
-      mutate(rv$normalized_data,   State = "After",  batch = as.factor(batch))
-    )
-    
-    df$State <- factor(df$State, levels = c("Before", "After"))
-    
-    # Choose professional qualitative color palette
-    palette <- RColorBrewer::brewer.pal(min(length(unique(df$batch)), 8), "Set2")
-    
-    # Density plot with faceting by "Before/After" state
-    ggplot(df, aes_string(x = marker, fill = "batch", color = "batch")) +
-      geom_density(alpha = 0.4, size = 1.2, adjust = 1.2) +
-      facet_wrap(~State, ncol = 1, scales = "free_y") +
-      theme_minimal(base_size = 14) +
-      theme(
-        panel.grid.major = element_line(color = "grey90"),
-        panel.grid.minor = element_blank(),
-        axis.title = element_text(face = "bold", size = 14),
-        axis.text = element_text(size = 12, color = "black"),
-        legend.title = element_text(face = "bold", size = 13),
-        legend.text = element_text(size = 12),
-        strip.background = element_rect(fill = "grey95", color = NA),
-        strip.text = element_text(face = "bold", size = 13),
-        plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
-        plot.margin = margin(10, 10, 10, 10)
-      ) +
-      labs(
-        title = paste("Marker Density Before vs After cyCombine:", marker),
-        x = marker,
-        y = "Density",
-        fill = "Batch",
-        color = "Batch"
-      ) +
-      scale_fill_manual(values = palette) +
-      scale_color_manual(values = palette)
-  })
+  
+
+    output$hist_plot <- renderPlot({
+      req(rv$unnormalized_data, rv$normalized_data, input$viz_marker_hist)
+      
+      marker <- input$viz_marker_hist
+      
+      df <- bind_rows(
+        mutate(rv$unnormalized_data, State = "Before", batch = as.factor(batch)),
+        mutate(rv$normalized_data,   State = "After",  batch = as.factor(batch))
+      )
+      
+      df$State <- factor(df$State, levels = c("Before", "After"))
+      
+      # palette safe
+      nbatch <- length(unique(df$batch))
+      palette <- RColorBrewer::brewer.pal(min(max(nbatch, 3), 8), "Set2")
+      
+      ggplot(df, aes(x = .data[[marker]], fill = batch, color = batch)) +
+        geom_density(alpha = 0.4, linewidth = 1.1, adjust = 1.2) +
+        facet_wrap(~State, ncol = 1, scales = "free_y") +
+        theme_minimal(base_size = 14) +
+        theme(
+          panel.grid.major = element_line(color = "grey90"),
+          panel.grid.minor = element_blank(),
+          axis.title = element_text(face = "bold"),
+          axis.text = element_text(color = "black"),
+          legend.title = element_text(face = "bold"),
+          strip.background = element_rect(fill = "grey95", color = NA),
+          strip.text = element_text(face = "bold")
+        ) +
+        labs(
+          title = paste("Marker Density Before vs After cyCombine:", marker),
+          x = marker,
+          y = "Density",
+          fill = "Batch",
+          color = "Batch"
+        ) +
+        scale_fill_manual(values = palette) +
+        scale_color_manual(values = palette)
+    })
+
   
   # =============================================
   # 4. Process Normalized FCS Objects
   # =============================================
+ 
   process_normalized_fcs <- function(rv, input) {
-    # Create new FCS objects with normalized values
-    normalized_df <- rv$normalized_data
-    new_fs_list <- list()
     
-    marker_cols <- setdiff(colnames(normalized_df), c("batch", "File"))
-    
-    # Exclude covariate from markers if present
-    if (!is.null(input$covar) && input$covar %in% colnames(normalized_df)) {
-      marker_cols <- setdiff(colnames(normalized_df), c("batch", "File", input$covar))
+    # Vérifications de base
+    if (is.null(rv$panel_table) ||
+        is.null(rv$normalized_data) ||
+        is.null(rv$fs_list)) {
+      stop("Les données normalisées, le panel ou les fichiers FCS sont manquants.")
     }
+    
+    normalized_df <- rv$normalized_data
+    panel <- rv$panel_table
+    
+    if (!all(c("batch", "File") %in% colnames(normalized_df))) {
+      stop("Les colonnes 'batch' et 'File' sont absentes des données normalisées.")
+    }
+    
+    # Les noms du Batch 1 servent uniquement de noms internes communs
+    reference_batch_name <- get_batch_name(1)
+    reference_col <- paste0(reference_batch_name, "_Marker")
+    
+    if (!reference_col %in% colnames(panel)) {
+      stop(
+        "Colonne de marqueurs de référence introuvable : ",
+        reference_col
+      )
+    }
+    
+    reference_markers <- trimws(as.character(panel[[reference_col]]))
+    
+    # Préparer une copie des objets FCS en mémoire.
+    # Les fichiers source sur disque ne sont jamais modifiés.
+    normalized_fcs <- rv$fs_list
     
     for (i in seq_len(input$n_batches)) {
+      
       batch_name <- get_batch_name(i)
-      batch_fs <- rv$fs_list[[i]]
-      batch_design <- rv$design[rv$design$Batch == i, ]
+      fluo_col <- paste0(batch_name, "_Fluo")
       
-      # Map Marker → Fluorochrome
-      fluo_names <- rv$panel_table[[paste0(batch_name, "_Fluo")]]
-      markers    <- rv$panel_table[[paste0(batch_name, "_Marker")]]
-      valid_idx <- !is.na(fluo_names) & !is.na(markers)
-      marker_to_fluo <- setNames(fluo_names[valid_idx], markers[valid_idx])
-      
-      new_batch_fs <- list()
-      
-      for (j in seq_along(batch_fs)) {
-        ff <- batch_fs[[j]]
-        expr_mat <- exprs(ff)
-        file_name <- batch_design$File[j]
-        
-        # Subset normalized data for this batch/file
-        df_sub <- normalized_df[
-          normalized_df$batch == batch_name &
-            normalized_df$File == file_name, 
-        ]
-        if (nrow(df_sub) == 0) next
-        
-        # Replace original expression values with normalized values
-        for (m in markers) {
-          fluo <- marker_to_fluo[[m]]
-          if (!is.null(fluo) && fluo %in% colnames(expr_mat) && m %in% colnames(df_sub)) {
-            expr_mat[, fluo] <- df_sub[[m]]
-          }
-        }
-        exprs(ff) <- expr_mat
-        new_batch_fs[[j]] <- ff
+      if (!fluo_col %in% colnames(panel)) {
+        stop("Colonne de canaux introuvable : ", fluo_col)
       }
       
-      new_fs_list[[i]] <- new_batch_fs
+      batch_fs <- rv$fs_list[[i]]
+      fluo_names <- trimws(as.character(panel[[fluo_col]]))
+      
+      # Correspondance par ligne du panel :
+      # nom de référence du Batch 1 -> canal réel du batch courant.
+      valid_idx <- (
+        !is.na(reference_markers) &
+          reference_markers != "" &
+          !is.na(fluo_names) &
+          fluo_names != ""
+      )
+      
+      marker_to_fluo <- stats::setNames(
+        fluo_names[valid_idx],
+        reference_markers[valid_idx]
+      )
+      
+      if (anyDuplicated(names(marker_to_fluo))) {
+        stop(
+          "Les noms de marqueurs de référence du Batch 1 ne sont pas uniques."
+        )
+      }
+      
+      if (anyDuplicated(unname(marker_to_fluo))) {
+        stop(
+          "Plusieurs marqueurs sélectionnés correspondent au même canal dans ",
+          batch_name, "."
+        )
+      }
+      
+      # Vérifier que les canaux existent réellement dans les FCS du batch.
+      available_channels <- as.character(
+        batch_fs[[1]]@parameters@data$name
+      )
+      
+      missing_channels <- setdiff(
+        unname(marker_to_fluo),
+        available_channels
+      )
+      
+      if (length(missing_channels) > 0) {
+        stop(
+          "Canaux absents du batch ", batch_name, " : ",
+          paste(missing_channels, collapse = ", ")
+        )
+      }
+      
+      # Colonnes normalisées communes, nommées selon le Batch 1.
+      markers_to_update <- intersect(
+        names(marker_to_fluo),
+        colnames(normalized_df)
+      )
+      
+      if (length(markers_to_update) == 0) {
+        next
+      }
+      
+      for (j in seq_along(batch_fs)) {
+        
+        # Retrouver les événements correspondant au fichier.
+        file_name <- as.character(
+          rv$design$File[
+            rv$design$Batch == i
+          ][j]
+        )
+        
+        batch_label <- as.character(
+          rv$design$BatchName[
+            rv$design$Batch == i
+          ][j]
+        )
+        
+        rows <- (
+          as.character(normalized_df$batch) == batch_label &
+            as.character(normalized_df$File) == file_name
+        )
+        
+        rows[is.na(rows)] <- FALSE
+        df_sub <- normalized_df[rows, , drop = FALSE]
+        
+        if (nrow(df_sub) == 0) {
+          warning(
+            "Aucune donnée normalisée trouvée pour ",
+            batch_name, " / ", file_name,
+            ". Le fichier est conservé sans modification."
+          )
+          next
+        }
+        
+        fcs_obj <- batch_fs[[j]]
+        expr_mat <- flowCore::exprs(fcs_obj)
+        
+        if (nrow(df_sub) != nrow(expr_mat)) {
+          stop(
+            "Le nombre d'événements ne correspond pas pour ",
+            file_name, " (batch ", batch_name, "). ",
+            "FCS : ", nrow(expr_mat),
+            " ; données normalisées : ", nrow(df_sub), "."
+          )
+        }
+        
+        # Réinjecter chaque marqueur normalisé dans son canal d'origine.
+        for (marker in markers_to_update) {
+          
+          fluo <- unname(marker_to_fluo[marker])
+          
+          if (!fluo %in% colnames(expr_mat)) {
+            stop(
+              "Le canal '", fluo, "' est absent de ",
+              file_name, "."
+            )
+          }
+          
+          if (!marker %in% colnames(df_sub)) {
+            next
+          }
+          
+          values <- df_sub[[marker]]
+          
+          if (length(values) != nrow(expr_mat)) {
+            stop(
+              "Le nombre de valeurs ne correspond pas pour le marqueur '",
+              marker, "' dans ", file_name, "."
+            )
+          }
+          
+          expr_mat[, fluo] <- as.numeric(values)
+        }
+        
+        # Modifier uniquement l'objet FCS en mémoire.
+        flowCore::exprs(fcs_obj) <- expr_mat
+        batch_fs[[j]] <- fcs_obj
+      }
+      
+      normalized_fcs[[i]] <- batch_fs
     }
     
-    return(new_fs_list)
+    return(normalized_fcs)
   }
   
   # =============================================
   # 5. Marker to Fluorochrome Mapping Helper
   # =============================================
   get_marker_to_fluo <- function(batch_name) {
-    fluo <- rv$panel_table[[paste0(batch_name, "_Fluo")]]
-    marker <- rv$panel_table[[paste0(batch_name, "_Marker")]]
-    valid <- !is.na(fluo) & !is.na(marker)
-    setNames(fluo[valid], marker[valid])
+    
+    reference_batch <- get_batch_name(1)
+    
+    reference_col <- paste0(reference_batch, "_Marker")
+    fluo_col <- paste0(batch_name, "_Fluo")
+    
+    if (!all(c(reference_col, fluo_col) %in% names(rv$panel_table))) {
+      return(stats::setNames(character(0), character(0)))
+    }
+    
+    reference_markers <- trimws(
+      as.character(rv$panel_table[[reference_col]])
+    )
+    
+    fluo_names <- trimws(
+      as.character(rv$panel_table[[fluo_col]])
+    )
+    
+    valid <- (
+      !is.na(reference_markers) &
+        reference_markers != "" &
+        !is.na(fluo_names) &
+        fluo_names != ""
+    )
+    
+    mapping <- stats::setNames(
+      fluo_names[valid],
+      reference_markers[valid]
+    )
+    
+    mapping
   }
-  
   # =============================================
   # 6. Scatter Plot UI (Density Plot)
   # =============================================
@@ -962,60 +1642,148 @@ server <- function(input, output, session) {
   # Render plotDens Before / After
   # =========================
   output$dens_plot <- renderPlot({
-    req(input$viz_marker_x, input$viz_marker_y)
+    
+    req(
+      input$viz_marker_x,
+      input$viz_marker_y,
+      rv$fs_list,
+      rv$normalized_fcs,
+      rv$panel_table
+    )
+    
     marker_x <- input$viz_marker_x
     marker_y <- input$viz_marker_y
-    n_batches <- input$n_batches
+    n_batches <- min(
+      input$n_batches,
+      length(rv$fs_list),
+      length(rv$normalized_fcs)
+    )
     
-
-    all_x <- c()
-    all_y <- c()
+    validate(
+      need(n_batches > 0, "Aucun batch disponible."),
+      need(marker_x != marker_y, "Choisis deux marqueurs différents.")
+    )
+    
+    # Vérifier les correspondances et déterminer les limites communes
     file_indices <- vector("list", n_batches)
+    mappings <- vector("list", n_batches)
     
-    for(i in 1:n_batches){
+    all_x <- numeric(0)
+    all_y <- numeric(0)
+    
+    for (i in seq_len(n_batches)) {
+      
       batch_name <- get_batch_name(i)
+      
       file_choice <- input[[paste0("dens_file_batch_", i)]]
+      batch_files <- rv$design$File[rv$design$Batch == i]
       
-      file_idx <- which(rv$design$File[rv$design$Batch == i] == file_choice)
+      file_idx <- match(file_choice, batch_files)
       
-      if(length(file_idx) == 0){
-        file_indices[[i]] <- NA
+      if (is.na(file_idx)) {
+        file_indices[[i]] <- NA_integer_
         next
-      } else {
-        file_indices[[i]] <- file_idx[1]
       }
+      
+      file_indices[[i]] <- file_idx
       
       mapping <- get_marker_to_fluo(batch_name)
-      fluo_x <- mapping[[marker_x]]
-      fluo_y <- mapping[[marker_y]]
+      mappings[[i]] <- mapping
       
-      if(!is.null(fluo_x) && !is.null(fluo_y)){
-        all_x <- c(all_x,
-                   exprs(rv$fs_list[[i]][[file_idx[1]]])[, fluo_x],
-                   exprs(rv$normalized_fcs[[i]][[file_idx[1]]])[, fluo_x])
-        all_y <- c(all_y,
-                   exprs(rv$fs_list[[i]][[file_idx[1]]])[, fluo_y],
-                   exprs(rv$normalized_fcs[[i]][[file_idx[1]]])[, fluo_y])
+      fluo_x <- unname(mapping[marker_x])
+      fluo_y <- unname(mapping[marker_y])
+      
+      if (
+        length(fluo_x) != 1 || is.na(fluo_x) ||
+        length(fluo_y) != 1 || is.na(fluo_y) ||
+        !nzchar(fluo_x) || !nzchar(fluo_y)
+      ) {
+        next
       }
+      
+      # Avant
+      mat_before <- flowCore::exprs(
+        rv$fs_list[[i]][[file_idx]]
+      )
+      
+      if (!all(c(fluo_x, fluo_y) %in% colnames(mat_before))) {
+        next
+      }
+      
+      # Après
+      mat_after <- flowCore::exprs(
+        rv$normalized_fcs[[i]][[file_idx]]
+      )
+      
+      if (!all(c(fluo_x, fluo_y) %in% colnames(mat_after))) {
+        next
+      }
+      
+      all_x <- c(
+        all_x,
+        mat_before[, fluo_x],
+        mat_after[, fluo_x]
+      )
+      
+      all_y <- c(
+        all_y,
+        mat_before[, fluo_y],
+        mat_after[, fluo_y]
+      )
     }
     
-    xlim <- range(all_x, na.rm = TRUE)
-    ylim <- range(all_y, na.rm = TRUE)
+    validate(
+      need(length(all_x) > 0 && length(all_y) > 0,
+           "Aucune donnée disponible pour ces marqueurs. Vérifie leur correspondance dans le panel.")
+    )
     
-
-    par(mfrow = c(2, n_batches), mar = c(3,3,2,1), pty = "s")
+    xlim <- range(all_x[is.finite(all_x)], na.rm = TRUE)
+    ylim <- range(all_y[is.finite(all_y)], na.rm = TRUE)
     
-
-    for(i in 1:n_batches){
+    validate(
+      need(all(is.finite(xlim)) && diff(xlim) > 0,
+           "Les valeurs du marqueur X ne permettent pas de tracer le graphique."),
+      need(all(is.finite(ylim)) && diff(ylim) > 0,
+           "Les valeurs du marqueur Y ne permettent pas de tracer le graphique.")
+    )
+    
+    # Disposition : première ligne = avant, seconde ligne = après
+    old_par <- par(no.readonly = TRUE)
+    on.exit(par(old_par), add = TRUE)
+    
+    par(
+      mfrow = c(2, n_batches),
+      mar = c(4, 4, 3, 1),
+      pty = "s"
+    )
+    
+    # Graphiques avant normalisation
+    for (i in seq_len(n_batches)) {
+      
       file_idx <- file_indices[[i]]
-      if(is.na(file_idx)) next
-      
       batch_name <- get_batch_name(i)
-      mapping <- get_marker_to_fluo(batch_name)
-      fluo_x <- mapping[[marker_x]]
-      fluo_y <- mapping[[marker_y]]
       
-      if(is.null(fluo_x) || is.null(fluo_y)) next
+      if (is.na(file_idx)) {
+        plot.new()
+        title(main = paste("Before -", batch_name))
+        text(0.5, 0.5, "Aucun fichier sélectionné")
+        next
+      }
+      
+      mapping <- mappings[[i]]
+      fluo_x <- unname(mapping[marker_x])
+      fluo_y <- unname(mapping[marker_y])
+      
+      if (
+        length(fluo_x) != 1 || is.na(fluo_x) ||
+        length(fluo_y) != 1 || is.na(fluo_y) ||
+        !nzchar(fluo_x) || !nzchar(fluo_y)
+      ) {
+        plot.new()
+        title(main = paste("Before -", batch_name))
+        text(0.5, 0.5, "Marqueur non disponible")
+        next
+      }
       
       flowDensity::plotDens(
         rv$fs_list[[i]][[file_idx]],
@@ -1028,16 +1796,33 @@ server <- function(input, output, session) {
       )
     }
     
-    for(i in 1:n_batches){
+    # Graphiques après normalisation
+    for (i in seq_len(n_batches)) {
+      
       file_idx <- file_indices[[i]]
-      if(is.na(file_idx)) next
-      
       batch_name <- get_batch_name(i)
-      mapping <- get_marker_to_fluo(batch_name)
-      fluo_x <- mapping[[marker_x]]
-      fluo_y <- mapping[[marker_y]]
       
-      if(is.null(fluo_x) || is.null(fluo_y)) next
+      if (is.na(file_idx)) {
+        plot.new()
+        title(main = paste("After -", batch_name))
+        text(0.5, 0.5, "Aucun fichier sélectionné")
+        next
+      }
+      
+      mapping <- mappings[[i]]
+      fluo_x <- unname(mapping[marker_x])
+      fluo_y <- unname(mapping[marker_y])
+      
+      if (
+        length(fluo_x) != 1 || is.na(fluo_x) ||
+        length(fluo_y) != 1 || is.na(fluo_y) ||
+        !nzchar(fluo_x) || !nzchar(fluo_y)
+      ) {
+        plot.new()
+        title(main = paste("After -", batch_name))
+        text(0.5, 0.5, "Marqueur non disponible")
+        next
+      }
       
       flowDensity::plotDens(
         rv$normalized_fcs[[i]][[file_idx]],
@@ -1050,8 +1835,7 @@ server <- function(input, output, session) {
       )
     }
   })
-  
-  
+
   
   output$download_norm <- downloadHandler(
     filename = function() {
@@ -1076,20 +1860,20 @@ server <- function(input, output, session) {
         batch_fs <- rv$normalized_fcs[[i]]
         batch_name <- get_batch_name(i)
         
-        # Récupérer mapping marker → fluo
+        # R??cup??rer mapping marker ??? fluo
         mapping <- get_marker_to_fluo(batch_name)
         
         for (j in seq_along(batch_fs)) {
-          ff <- batch_fs[[j]]  # <-- define ff before using
+          ff <- batch_fs[[j]] 
           print("istransformed")
           print(rv$isTransformed)
-          # Détransfo uniquement si transformation appliquée
+          #
           if (isTRUE(rv$isTransformed)) {
             marker_cols <- rv$transformed_markers
             fluo <- mapping[marker_cols]
             print(rv$transformed_markers)
             print(fluo)
-            # Safety check
+            
             fluo <- fluo[!is.na(fluo)]
             if (length(fluo) > 0) {
               if (input$transform_mode == "global") {
@@ -1134,5 +1918,6 @@ server <- function(input, output, session) {
       removeModal()
     }
   )
+  
 }
 
