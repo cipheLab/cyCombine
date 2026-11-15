@@ -1325,45 +1325,62 @@ server <- function(input, output, session) {
   # =============================================
   
 
-    output$hist_plot <- renderPlot({
-      req(rv$unnormalized_data, rv$normalized_data, input$viz_marker_hist)
+  
+  output$hist_plot <- renderPlot({
+    req(rv$unnormalized_data, rv$normalized_data, input$viz_marker_hist)
+    
+    marker <- input$viz_marker_hist
+    
+    df <- bind_rows(
+      mutate(rv$unnormalized_data, State = "Before",
+             batch = as.factor(batch)),
+      mutate(rv$normalized_data, State = "After",
+             batch = as.factor(batch))
+    )
+    
+    df$State <- factor(df$State, levels = c("Before", "After"))
+    
+    # Generate enough colors for all batches
+    nbatch <- length(unique(df$batch))
+    
+    palette <- grDevices::colorRampPalette(
+      RColorBrewer::brewer.pal(8, "Set2")
+    )(nbatch)
+    
+    names(palette) <- levels(droplevels(df$batch))
+    
+    ggplot(df, aes(x = .data[[marker]],
+                   fill = batch,
+                   color = batch)) +
       
-      marker <- input$viz_marker_hist
+      geom_density(alpha = 0.4, linewidth = 1.1, adjust = 1.2) +
       
-      df <- bind_rows(
-        mutate(rv$unnormalized_data, State = "Before", batch = as.factor(batch)),
-        mutate(rv$normalized_data,   State = "After",  batch = as.factor(batch))
-      )
+      facet_wrap(~State, ncol = 1, scales = "free_y") +
       
-      df$State <- factor(df$State, levels = c("Before", "After"))
+      theme_minimal(base_size = 14) +
       
-      # palette safe
-      nbatch <- length(unique(df$batch))
-      palette <- RColorBrewer::brewer.pal(min(max(nbatch, 3), 8), "Set2")
+      theme(
+        panel.grid.major = element_line(color = "grey90"),
+        panel.grid.minor = element_blank(),
+        axis.title = element_text(face = "bold"),
+        axis.text = element_text(color = "black"),
+        legend.title = element_text(face = "bold"),
+        strip.background = element_rect(fill = "grey95", color = NA),
+        strip.text = element_text(face = "bold")
+      ) +
       
-      ggplot(df, aes(x = .data[[marker]], fill = batch, color = batch)) +
-        geom_density(alpha = 0.4, linewidth = 1.1, adjust = 1.2) +
-        facet_wrap(~State, ncol = 1, scales = "free_y") +
-        theme_minimal(base_size = 14) +
-        theme(
-          panel.grid.major = element_line(color = "grey90"),
-          panel.grid.minor = element_blank(),
-          axis.title = element_text(face = "bold"),
-          axis.text = element_text(color = "black"),
-          legend.title = element_text(face = "bold"),
-          strip.background = element_rect(fill = "grey95", color = NA),
-          strip.text = element_text(face = "bold")
-        ) +
-        labs(
-          title = paste("Marker Density Before vs After cyCombine:", marker),
-          x = marker,
-          y = "Density",
-          fill = "Batch",
-          color = "Batch"
-        ) +
-        scale_fill_manual(values = palette) +
-        scale_color_manual(values = palette)
-    })
+      labs(
+        title = paste("Marker Density Before vs After cyCombine:", marker),
+        x = marker,
+        y = "Density",
+        fill = "Batch",
+        color = "Batch"
+      ) +
+      
+      scale_fill_manual(values = palette) +
+      scale_color_manual(values = palette)
+  })
+  
 
   
   # =============================================
